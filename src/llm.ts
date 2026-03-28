@@ -1103,12 +1103,133 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_TEMPLATE_OVERHEAD = 200;
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
+  /**
+   * Rerank documents using either a remote API (NVIDIA NIM) or local GGUF model.
+   *
+   * Set QMD_RERANK_API_URL and QMD_RERANK_API_KEY (or NVIDIA_API_KEY) env vars
+   * to use the remote API. Otherwise falls back to local model.
+   *
+   * Remote model can be set via QMD_RERANK_API_MODEL (default: nvidia/nvidia/llama-3.2-nv-rerankqa-1b-v2).
+   */
   async rerank(
     query: string,
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+
+    const apiUrl = process.env.QMD_RERANK_API_URL;
+    const apiKey = process.env.QMD_RERANK_API_KEY || process.env.NVIDIA_API_KEY;
+
+    if (apiUrl && apiKey) {
+      return this.rerankViaApi(query, documents, apiUrl, apiKey);
+    }
+
+    return this.rerankLocal(query, documents, options);
+  }
+
+  /**
+   * Rerank via NVIDIA NIM-compatible /v1/rerank API.
+   * Sends documents in batches (max 64 per request) and merges results.
+   */
+  private async rerankViaApi(
+    query: string,
+    documents: RerankDocument[],
+    apiUrl: string,
+    apiKey: string,
+  ): Promise<RerankResult> {
+    const model = process.env.QMD_RERANK_API_MODEL || "nvidia/nvidia/llama-3.2-nv-rerankqa-1b-v2";
+    const BATCH_SIZE = 64;
+
+    // Deduplicate identical texts before sending to API
+    const textToDocs = new Map<string, { file: string; index: number }[]>();
+    documents.forEach((doc, index) => {
+      const existing = textToDocs.get(doc.text);
+      if (existing) {
+        existing.push({ file: doc.file, index });
+      } else {
+        textToDocs.set(doc.text, [{ file: doc.file, index }]);
+      }
+    });
+
+    const uniqueTexts = Array.from(textToDocs.keys());
+
+    // Truncate texts to ~2000 chars to stay within API limits
+    const truncatedTexts = uniqueTexts.map(t => t.length > 2000 ? t.slice(0, 2000) : t);
+
+    // Send in batches
+    const allApiResults: { index: number; score: number }[] = [];
+    for (let i = 0; i < truncatedTexts.length; i += BATCH_SIZE) {
+      const batch = truncatedTexts.slice(i, i + BATCH_SIZE);
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          query,
+          documents: batch,
+          top_n: batch.length,
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Rerank API error (${response.status}): ${errText}`);
+      }
+
+      const data = await response.json() as {
+        results: { index: number; relevance_score: number }[];
+      };
+
+      // Remap indices to global position
+      for (const r of data.results) {
+        allApiResults.push({
+          index: i + r.index,
+          score: r.relevance_score,
+        });
+      }
+    }
+
+    // Normalize scores to [0, 1] range using sigmoid
+    const normalizedScores = allApiResults.map(r => ({
+      ...r,
+      score: 1 / (1 + Math.exp(-r.score)),
+    }));
+
+    // Sort by score descending
+    normalizedScores.sort((a, b) => b.score - a.score);
+
+    // Map back to result format
+    const results: RerankDocumentResult[] = [];
+    for (const item of normalizedScores) {
+      const text = uniqueTexts[item.index]!;
+      const docInfos = textToDocs.get(text) ?? [];
+      for (const docInfo of docInfos) {
+        results.push({
+          file: docInfo.file,
+          score: item.score,
+          index: docInfo.index,
+        });
+      }
+    }
+
+    return {
+      results,
+      model,
+    };
+  }
+
+  /**
+   * Rerank using local GGUF model via node-llama-cpp (original implementation).
+   */
+  private async rerankLocal(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
