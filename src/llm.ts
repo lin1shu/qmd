@@ -1100,16 +1100,112 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
+  /**
+   * Expand a search query into multiple typed variations.
+   * Uses NVIDIA API (GPT-5.4) if QMD_GENERATE_API_URL is set,
+   * otherwise falls back to local GGUF model (Qwen3-1.7B).
+   */
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
+    const apiUrl = process.env.QMD_GENERATE_API_URL;
+    const apiKey = process.env.QMD_GENERATE_API_KEY || process.env.NVIDIA_API_KEY;
+
+    if (apiUrl && apiKey) {
+      return this.expandQueryViaApi(query, apiUrl, apiKey, options);
+    }
+
+    return this.expandQueryLocal(query, options);
+  }
+
+  /**
+   * Expand query via an OpenAI-compatible chat/responses API (e.g. GPT-5.4 on NVIDIA NIM).
+   * Uses structured prompt instructions instead of GBNF grammar.
+   */
+  private async expandQueryViaApi(
+    query: string,
+    apiUrl: string,
+    apiKey: string,
+    options: { context?: string, includeLexical?: boolean, intent?: string } = {},
+  ): Promise<Queryable[]> {
+    const model = process.env.QMD_GENERATE_API_MODEL || "openai/openai/gpt-5.4";
+    const includeLexical = options.includeLexical ?? true;
+
+    const systemPrompt = `You are a search query expansion assistant. Given a user search query, expand it into multiple search variations.
+
+Output ONLY lines in this exact format, one per line, with no other text:
+type: content
+
+Where type is one of:
+- lex: keyword/lexical search variations (synonyms, related terms)
+- vec: semantic search variations (rephrasings that capture meaning)
+- hyde: hypothetical document excerpts (short text that a relevant result might contain)
+
+Generate 3-6 lines covering different types. Be concise and directly relevant to the query.`;
+
+    const userPrompt = options.intent
+      ? `Expand this search query: ${query}\nQuery intent: ${options.intent}`
+      : `Expand this search query: ${query}`;
+
+    try {
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          instructions: systemPrompt,
+          input: userPrompt,
+          max_tokens: 600,
+          temperature: 0.7,
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Generate API error (${response.status}): ${errText}`);
+      }
+
+      const data = await response.json() as {
+        output?: { content?: { text: string; type: string }[] }[];
+      };
+
+      // Extract text from /v1/responses format: output[].content[].text
+      let resultText = "";
+      if (data.output) {
+        for (const msg of data.output) {
+          if (msg.content) {
+            for (const block of msg.content) {
+              if (block.type === "output_text" && block.text) {
+                resultText += block.text;
+              }
+            }
+          }
+        }
+      }
+
+      return this.parseExpandedQuery(resultText, query, includeLexical);
+    } catch (error) {
+      console.error("API query expansion failed:", error);
+      // Fallback to original query
+      const fallback: Queryable[] = [{ type: 'vec', text: query }];
+      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
+      return fallback;
+    }
+  }
+
+  /**
+   * Expand query using local GGUF model (Qwen3-1.7B) with GBNF grammar.
+   */
+  private async expandQueryLocal(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     const llama = await this.ensureLlama();
     await this.ensureGenerateModel();
 
     const includeLexical = options.includeLexical ?? true;
-    const context = options.context;
 
     const grammar = await llama.createGrammar({
       grammar: `
@@ -1148,36 +1244,7 @@ export class LlamaCpp implements LLM {
         },
       });
 
-      const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-
-      const hasQueryTerm = (text: string): boolean => {
-        const lower = text.toLowerCase();
-        if (queryTerms.length === 0) return true;
-        return queryTerms.some(term => lower.includes(term));
-      };
-
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        if (!hasQueryTerm(text)) return null;
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
-      if (filtered.length > 0) return filtered;
-
-      const fallback: Queryable[] = [
-        { type: 'hyde', text: `Information about ${query}` },
-        { type: 'lex', text: query },
-        { type: 'vec', text: query },
-      ];
-      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+      return this.parseExpandedQuery(result, query, includeLexical);
     } catch (error) {
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
@@ -1187,6 +1254,42 @@ export class LlamaCpp implements LLM {
     } finally {
       await genContext.dispose();
     }
+  }
+
+  /**
+   * Parse the text output from query expansion (local or API) into Queryable[].
+   */
+  private parseExpandedQuery(result: string, query: string, includeLexical: boolean): Queryable[] {
+    const lines = result.trim().split("\n");
+    const queryLower = query.toLowerCase();
+    const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+
+    const hasQueryTerm = (text: string): boolean => {
+      const lower = text.toLowerCase();
+      if (queryTerms.length === 0) return true;
+      return queryTerms.some(term => lower.includes(term));
+    };
+
+    const queryables: Queryable[] = lines.map(line => {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx === -1) return null;
+      const type = line.slice(0, colonIdx).trim();
+      if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
+      const text = line.slice(colonIdx + 1).trim();
+      if (!hasQueryTerm(text)) return null;
+      return { type: type as QueryType, text };
+    }).filter((q): q is Queryable => q !== null);
+
+    // Filter out lex entries if not requested
+    const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+    if (filtered.length > 0) return filtered;
+
+    const fallback: Queryable[] = [
+      { type: 'hyde', text: `Information about ${query}` },
+      { type: 'lex', text: query },
+      { type: 'vec', text: query },
+    ];
+    return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
   }
 
   // Qwen3 reranker chat template overhead (system prompt, tags, separators)
