@@ -854,7 +854,102 @@ export class LlamaCpp implements LLM {
     return { text: truncatedText, truncated: true };
   }
 
+  /**
+   * Embed a single text. Uses NVIDIA API if QMD_EMBED_API_URL is set,
+   * otherwise falls back to local GGUF model.
+   */
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    const apiUrl = process.env.QMD_EMBED_API_URL;
+    const apiKey = process.env.QMD_EMBED_API_KEY || process.env.NVIDIA_API_KEY;
+
+    if (apiUrl && apiKey) {
+      const results = await this.embedBatchViaApi([text], apiUrl, apiKey);
+      return results[0] ?? null;
+    }
+
+    return this.embedLocal(text, options);
+  }
+
+  /**
+   * Batch embed multiple texts. Uses NVIDIA API if QMD_EMBED_API_URL is set,
+   * otherwise falls back to local GGUF model.
+   */
+  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+
+    if (texts.length === 0) return [];
+
+    const apiUrl = process.env.QMD_EMBED_API_URL;
+    const apiKey = process.env.QMD_EMBED_API_KEY || process.env.NVIDIA_API_KEY;
+
+    if (apiUrl && apiKey) {
+      return this.embedBatchViaApi(texts, apiUrl, apiKey);
+    }
+
+    return this.embedBatchLocal(texts);
+  }
+
+  /**
+   * Embed texts via an OpenAI-compatible /v1/embeddings API (e.g. NVIDIA NIM).
+   * Sends in batches of up to 64 texts per request.
+   *
+   * Set QMD_EMBED_API_URL, QMD_EMBED_API_MODEL, and NVIDIA_API_KEY (or QMD_EMBED_API_KEY).
+   */
+  private async embedBatchViaApi(
+    texts: string[],
+    apiUrl: string,
+    apiKey: string,
+  ): Promise<(EmbeddingResult | null)[]> {
+    const model = process.env.QMD_EMBED_API_MODEL || "azure/openai/text-embedding-3-large";
+    const BATCH_SIZE = 64;
+    const MAX_CHARS = 8000; // Truncate long texts to stay within API token limits
+
+    const allResults: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const batch = texts.slice(i, i + BATCH_SIZE);
+      const truncatedBatch = batch.map(t => t.length > MAX_CHARS ? t.slice(0, MAX_CHARS) : t);
+
+      try {
+        const response = await fetch(apiUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            input: truncatedBatch,
+            truncate: "END",
+          }),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Embedding API error (${response.status}): ${errText}`);
+        }
+
+        const data = await response.json() as {
+          data: { index: number; embedding: number[] }[];
+          model: string;
+        };
+
+        for (const item of data.data) {
+          allResults[i + item.index] = {
+            embedding: item.embedding,
+            model: data.model || model,
+          };
+        }
+      } catch (error) {
+        console.error(`Embedding API batch error (offset ${i}):`, error);
+        // Leave failed batch entries as null
+      }
+    }
+
+    return allResults;
+  }
+
+  private async embedLocal(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -879,12 +974,7 @@ export class LlamaCpp implements LLM {
     }
   }
 
-  /**
-   * Batch embed multiple texts efficiently
-   * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
-   */
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
+  private async embedBatchLocal(texts: string[]): Promise<(EmbeddingResult | null)[]> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
