@@ -1121,8 +1121,9 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Expand query via an OpenAI-compatible chat/responses API (e.g. GPT-5.4 on NVIDIA NIM).
-   * Uses structured prompt instructions instead of GBNF grammar.
+   * Expand query via an OpenAI-compatible /v1/responses API (e.g. GPT-5.4 on NVIDIA NIM).
+   * Uses tool-use flow: the model can call lookup_acronyms to resolve domain acronyms
+   * before generating expansions. Acronym dictionary loaded from QMD_ACRONYMS_PATH.
    */
   private async expandQueryViaApi(
     query: string,
@@ -1135,44 +1136,108 @@ export class LlamaCpp implements LLM {
 
     const systemPrompt = `You are a search query expansion assistant. Given a user search query, expand it into multiple search variations.
 
-Output ONLY lines in this exact format, one per line, with no other text:
+If the query contains acronyms or abbreviations that could be ambiguous, call the lookup_acronyms tool FIRST to get their definitions, then use those definitions to generate accurate expansions.
+
+After resolving any acronyms, output ONLY lines in this exact format, one per line, with no other text:
 type: content
 
 Where type is one of:
-- lex: keyword/lexical search variations (synonyms, related terms)
+- lex: keyword/lexical search variations (synonyms, related terms, expanded acronyms)
 - vec: semantic search variations (rephrasings that capture meaning)
 - hyde: hypothetical document excerpts (short text that a relevant result might contain)
 
 Generate 3-6 lines covering different types. Be concise and directly relevant to the query.`;
+
+    const tools = [
+      {
+        type: "function",
+        name: "lookup_acronyms",
+        description: "Look up the meaning of acronyms or abbreviations found in the search query. Call this when you encounter terms that could be acronyms (e.g. uppercase words, short abbreviations).",
+        parameters: {
+          type: "object",
+          properties: {
+            acronyms: {
+              type: "array",
+              items: { type: "string" },
+              description: "List of acronyms/abbreviations to look up",
+            },
+          },
+          required: ["acronyms"],
+        },
+      },
+    ];
 
     const userPrompt = options.intent
       ? `Expand this search query: ${query}\nQuery intent: ${options.intent}`
       : `Expand this search query: ${query}`;
 
     try {
-      const response = await fetch(apiUrl, {
+      const headers = {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      };
+
+      // First request: model may call lookup_acronyms or respond directly
+      const firstResponse = await fetch(apiUrl, {
         method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
+        headers,
         body: JSON.stringify({
           model,
           instructions: systemPrompt,
           input: userPrompt,
+          tools,
           max_tokens: 600,
           temperature: 0.7,
         }),
       });
 
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Generate API error (${response.status}): ${errText}`);
+      if (!firstResponse.ok) {
+        const errText = await firstResponse.text();
+        throw new Error(`Generate API error (${firstResponse.status}): ${errText}`);
       }
 
-      const data = await response.json() as {
-        output?: { content?: { text: string; type: string }[] }[];
-      };
+      let data = await firstResponse.json() as any;
+
+      // Check if the model called the lookup_acronyms tool
+      const toolCall = data.output?.find((o: any) => o.type === "function_call" && o.name === "lookup_acronyms");
+
+      if (toolCall) {
+        // Resolve acronyms from dictionary
+        let requestedAcronyms: string[] = [];
+        try {
+          const args = JSON.parse(toolCall.arguments || "{}");
+          requestedAcronyms = args.acronyms || [];
+        } catch {}
+
+        const definitions = this.lookupAcronyms(requestedAcronyms);
+        const toolOutput = JSON.stringify(definitions);
+        console.error(`Acronym lookup: ${requestedAcronyms.join(", ")} → ${toolOutput}`);
+
+        // Second request: send tool result back, model generates final expansion
+        const secondResponse = await fetch(apiUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model,
+            instructions: systemPrompt,
+            previous_response_id: data.id,
+            input: [{
+              type: "function_call_output",
+              call_id: toolCall.call_id,
+              output: toolOutput,
+            }],
+            max_tokens: 600,
+            temperature: 0.7,
+          }),
+        });
+
+        if (!secondResponse.ok) {
+          const errText = await secondResponse.text();
+          throw new Error(`Generate API tool follow-up error (${secondResponse.status}): ${errText}`);
+        }
+
+        data = await secondResponse.json();
+      }
 
       // Extract text from /v1/responses format: output[].content[].text
       let resultText = "";
@@ -1191,10 +1256,57 @@ Generate 3-6 lines covering different types. Be concise and directly relevant to
       return this.parseExpandedQuery(resultText, query, includeLexical);
     } catch (error) {
       console.error("API query expansion failed:", error);
-      // Fallback to original query
       const fallback: Queryable[] = [{ type: 'vec', text: query }];
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
+    }
+  }
+
+  /**
+   * Look up acronyms from the dictionary file at QMD_ACRONYMS_PATH.
+   * Returns a map of acronym → definition (or "unknown" if not found).
+   */
+  private lookupAcronyms(acronyms: string[]): Record<string, string> {
+    const dictPath = process.env.QMD_ACRONYMS_PATH;
+    if (!dictPath) return Object.fromEntries(acronyms.map(a => [a, "unknown — no acronym dictionary configured"]));
+
+    try {
+      const raw = readFileSync(dictPath, "utf-8");
+
+      // Support both TSV and JSON formats
+      const dict = new Map<string, string[]>(); // lowercase key → list of definitions
+      if (dictPath.endsWith(".tsv")) {
+        const lines = raw.split("\n");
+        // Skip header row
+        for (let i = 1; i < lines.length; i++) {
+          const cols = lines[i]!.split("\t");
+          const col0 = cols[0] ?? "";
+          const col1 = cols[1] ?? "";
+          if (cols.length < 2 || !col0.trim()) continue;
+          const acronym = col0.trim().toLowerCase();
+          const meaning = col1.trim();
+          const notes = (cols[2] ?? "").trim();
+          const def = notes ? `${meaning} (${notes})` : meaning;
+          if (!dict.has(acronym)) dict.set(acronym, []);
+          dict.get(acronym)!.push(def);
+        }
+      } else {
+        // JSON format: { "ACRONYM": "definition" }
+        const jsonDict: Record<string, string> = JSON.parse(raw);
+        for (const [k, v] of Object.entries(jsonDict)) {
+          dict.set(k.toLowerCase(), [v]);
+        }
+      }
+
+      const result: Record<string, string> = {};
+      for (const acr of acronyms) {
+        const defs = dict.get(acr.toLowerCase());
+        result[acr] = defs ? defs.join("; OR ") : `unknown — not found in dictionary`;
+      }
+      return result;
+    } catch (err) {
+      console.error("Failed to load acronym dictionary:", err);
+      return Object.fromEntries(acronyms.map(a => [a, "unknown — dictionary load error"]));
     }
   }
 
